@@ -1,99 +1,108 @@
-import java.time.Duration
-
-import java.util.concurrent.{BlockingQueue, LinkedBlockingQueue, TimeUnit}
-import scala.collection.JavaConverters._
-import KafkaStreaming._
+import org.apache.spark.streaming.StreamingContext
+import org.apache.spark.streaming.kafka010.{KafkaUtils, LocationStrategies, ConsumerStrategies}
+import org.apache.kafka.clients.consumer.ConsumerRecord
+import org.apache.spark.streaming.kafka010.HasOffsetRanges
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkContext
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
+import org.apache.spark.sql.functions._
 import org.apache.log4j.{LogManager, Logger}
-import org.apache.spark.streaming.twitter.TwitterUtils
 
-import SparkBigData._
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
-import org.apache.spark.sql.SQLContext
-import org.apache.spark.streaming.Minutes
+object TwitterKafkaStreaming {
 
-// développer des clients streaming qui consomment les données de Twitter et les poussent dans Kafka
-class TwitterKafkaStreaming {
+  val batchDuration: Int = 15
+  val checkpointChemin: String = "/Hadoop/mhgb/datalake/"
 
-  private var trace_client_streaming : Logger = LogManager.getLogger("Log_Console")
+  val schema_Kafka = StructType(Array(
+    StructField("Zipcode", IntegerType, true),
+    StructField("ZipCodeType", StringType, true),
+    StructField("City", StringType, true),
+    StructField("State", StringType, true)
+  ))
 
-  /**
-   *  Client Spark Streaming Twitter Kafka. Ce client Spark Streaming se connecte à Twitter et publie les infos dans Kafka via un Producer Kafka
-   * @param CONSUMER_KEY
-   * @param CONSUMER_SECRET
-   * @param ACCESS_TOKEN
-   * @param TOKEN_SECRET
-   * @param filtre
-   * @param kafkaBootStrapServers
-   * @param topic
-   */
-  def ProducerTwitterKafkaSpark (CONSUMER_KEY : String, CONSUMER_SECRET : String, ACCESS_TOKEN : String, TOKEN_SECRET : String, filtre : Array[String],
-                                 kafkaBootStrapServers : String, topic : String) : Unit = {
+  private var trace_consommation: Logger = LogManager.getLogger("Log_Console")
 
-    val authO = new OAuthAuthorization(twitterOAuthConf(CONSUMER_KEY, CONSUMER_SECRET, ACCESS_TOKEN, TOKEN_SECRET).build())
+  def main(args: Array[String]): Unit = {
 
-    val client_Streaming_Twitter = TwitterUtils.createStream(getSparkStreamingContext(true, 15), Some(authO), filtre)
+    val conf = new SparkConf().setAppName("YourAppName").setMaster("local[*]")
+    val sc = new SparkContext(conf)
 
-    val tweetsmsg = client_Streaming_Twitter.flatMap(status => status.getText())
-    val tweetsComplets = client_Streaming_Twitter.flatMap(status => (status.getText() ++ status.getContributors() ++ status.getLang()))
-    val tweetsFR = client_Streaming_Twitter.filter(status => status.getLang() == "fr")
-    val hastags = client_Streaming_Twitter.flatMap(status => status.getText().split(" ").filter(status => status.startsWith("#")))
-    val hastagsFR = tweetsFR.flatMap(status => status.getText().split(" ").filter(status => status.startsWith("#")))
-    val hastagsCount = hastagsFR.window(Minutes(3))
+    val ssc = getSparkStreamingContext(true, batchDuration, sc)
 
-    // ATTENTION à cette erreur !!! getProducerKafka(kafkaBootStrapServers, topic, tweetsmsg.toString())
+    val kafkaStreams = getConsommateurKafka(sys.env("BOOTSTRAP_SERVERS"), "", "", sys.env("ZOOKEEPER"), "", Array(""), ssc)
 
-    // tweetsmsg.saveAsTextFiles("Tweets")
+    kafkaStreams.foreachRDD {
+      rddKafka =>
+        if (!rddKafka.isEmpty()) {
 
-    tweetsmsg.foreachRDD {
-      (tweetsRDD, temps) =>
-        if (!tweetsRDD.isEmpty()) {
-          tweetsRDD.foreachPartition {
-            partitionsOfTweets =>
-              val producer_Kafka = new KafkaProducer[String, String](getKafkaProducerParams(kafkaBootStrapServers))
-              partitionsOfTweets.foreach {
-                tweetEvent =>
-                  val record_publish = new ProducerRecord[String, String](topic, tweetEvent.toString)
-                  producer_Kafka.send(record_publish)
+          val offsets = rddKafka.asInstanceOf[HasOffsetRanges].offsetRanges
+          val dataStreams = rddKafka.map(record => record.value())
 
-              }
-              producer_Kafka.close()
+          val ss = SparkSession.builder.config(rddKafka.sparkContext.getConf).enableHiveSupport.getOrCreate()
+          import ss.implicits._
+
+          val df_kafka = dataStreams.toDF("tweet_message")
+
+          df_kafka.createOrReplaceGlobalTempView("kafka_events")
+
+          val df_eventsKafka = ss.sql("select * from kafka_events")
+
+          df_eventsKafka.show()
+
+          val df_eventsKafka_2 = df_kafka.withColumn("tweet_message", from_json(col("tweet_message"), schema_Kafka))
+            .select(col("tweet_message.*"))
+
+          trace_consommation.info("Persistance des offsets dans Kafka en cours....")
+          kafkaStreams.asInstanceOf[CanCommitOffsets].commitAsync(offsets)
+          trace_consommation.info("Persistance des offsets dans Kafka terminée avec succès ! :) ")
+
+        }
+    }
+
+    kafkaStreams.foreachRDD {
+      rddKafka =>
+        if (!rddKafka.isEmpty()) {
+          val offsets = rddKafka.asInstanceOf[HasOffsetRanges].offsetRanges
+
+          val datastreams = rddKafka.map(event => event.value())
+
+          for(o <- offsets){
+            println(s"Le topic lu est : ${o.topic},  la partition est : ${o.partition}, l'offset de début est : ${o.fromOffset}, l'offset de fin est : ${o.untilOffset}")
           }
         }
     }
 
-    try {
-      tweetsComplets.foreachRDD {
-        tweetsRDD =>
-          if (!tweetsRDD.isEmpty()) {
-            tweetsRDD.foreachPartition{
-              tweetsPartition => tweetsPartition.foreach{ tweets =>
-                getProducerKafka(kafkaBootStrapServers, topic, tweets.toString )
-              }
-            }
-          }
-          getProducerKafka(kafkaBootStrapServers, "", "").close()
-      }
-    }
-    catch {
-      case ex : Exception => trace_client_streaming.error(ex.printStackTrace())
-    }
-
-    getSparkStreamingContext(true, 15).start()
-    getSparkStreamingContext(true, 15).awaitTermination()
-
-    // pour arrêter le contexte Spark Streaming : getSparkStreamingContext(true, 15).stop()
-
+    ssc.start()
+    ssc.awaitTermination()
   }
 
-
-  // exemple de spécification d'un paramètre optionel en scala
-  test(Some(true), 15)
-
-  // exemple de spécification d'un paramètre optionel en scala
-  def test (var1 : Option[Boolean], param2 : Int): Unit = {
-    println(var1)
-
+  def getSparkStreamingContext(checkpointing: Boolean, batchDuration: Int, sc: SparkContext): StreamingContext = {
+    val ssc = new StreamingContext(sc, Seconds(batchDuration))
+    if (checkpointing) {
+      ssc.checkpoint(checkpointChemin)
+    }
+    ssc
   }
 
+  def getConsommateurKafka(bootStrapServers: String, consumerGroupId: String, consumerReadOrder: String, zookeeper: String,
+                           kerberosName: String, topics: Array[String], ssc: StreamingContext) = {
+    KafkaUtils.createDirectStream[String, String](
+      ssc,
+      LocationStrategies.PreferConsistent,
+      ConsumerStrategies.Subscribe[String, String](topics, kafkaParams(bootStrapServers, consumerGroupId, consumerReadOrder, zookeeper, kerberosName))
+    )
+  }
 
+  def kafkaParams(bootStrapServers: String, consumerGroupId: String, consumerReadOrder: String, zookeeper: String,
+                  kerberosName: String): Map[String, Object] = {
+    Map[String, Object](
+      "bootstrap.servers" -> bootStrapServers,
+      "group.id" -> consumerGroupId,
+      "auto.offset.reset" -> consumerReadOrder,
+      "zookeeper.connect" -> zookeeper,
+      "security.protocol" -> "SASL_PLAINTEXT",
+      "sasl.kerberos.service.name" -> kerberosName
+    )
+  }
 }
